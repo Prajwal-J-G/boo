@@ -1,0 +1,79 @@
+name: Deploy private site
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STACK_NAME: our-always-private
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: backend/go.sum
+      - run: go test ./...
+        working-directory: backend
+      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Build and deploy infrastructure
+        shell: bash
+        run: |
+          sam validate --template-file template.yaml
+          sam build --template-file template.yaml
+          sam deploy \
+            --stack-name "$STACK_NAME" \
+            --resolve-s3 \
+            --resolve-image-repos \
+            --capabilities CAPABILITY_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides FrontendOrigin=http://localhost:5173
+
+          website_url="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='WebsiteUrl'].OutputValue | [0]" --output text)"
+          sam deploy \
+            --stack-name "$STACK_NAME" \
+            --resolve-s3 \
+            --resolve-image-repos \
+            --capabilities CAPABILITY_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides "FrontendOrigin=$website_url"
+
+          echo "website_url=$website_url" >> "$GITHUB_ENV"
+          echo "api_url=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue | [0]" --output text)" >> "$GITHUB_ENV"
+          echo "user_pool_id=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue | [0]" --output text)" >> "$GITHUB_ENV"
+          echo "user_pool_client_id=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='UserPoolClientId'].OutputValue | [0]" --output text)" >> "$GITHUB_ENV"
+          echo "web_bucket=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='WebBucketName'].OutputValue | [0]" --output text)" >> "$GITHUB_ENV"
+          echo "distribution_id=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='WebDistributionId'].OutputValue | [0]" --output text)" >> "$GITHUB_ENV"
+      - name: Build and publish frontend
+        run: VITE_API_URL="$api_url" VITE_COGNITO_USER_POOL_ID="$user_pool_id" VITE_COGNITO_CLIENT_ID="$user_pool_client_id" npm run build
+      - name: Sync CloudFront origin and invalidate cache
+        run: |
+          aws s3 sync dist/ "s3://${web_bucket}" --delete
+          aws cloudfront create-invalidation --distribution-id "$distribution_id" --paths '/*'
+          echo "Deployed site: $website_url"
