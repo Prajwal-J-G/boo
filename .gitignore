@@ -12,6 +12,7 @@ dist
 dist-ssr
 *.local
 .aws-sam
+samconfig.toml
 playwright-report
 test-results
 .env
