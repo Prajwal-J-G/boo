@@ -1,0 +1,3 @@
+location           = "Central India"
+resource_group_name = "our-always-web-rg"
+name_prefix         = "ouralways"

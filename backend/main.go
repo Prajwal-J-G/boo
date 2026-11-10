@@ -24,6 +24,7 @@ import (
 
 type Entry struct {
 	ID        string `json:"id" dynamodbav:"ID"`
+	SortKey   string `json:"sortKey,omitempty" dynamodbav:"SK"`
 	Kind      string `json:"kind" dynamodbav:"Kind"`
 	Title     string `json:"title" dynamodbav:"Title"`
 	Body      string `json:"body" dynamodbav:"Body"`
@@ -34,7 +35,6 @@ type Entry struct {
 	Author    string `json:"author,omitempty" dynamodbav:"Author,omitempty"`
 	CreatedAt string `json:"-" dynamodbav:"CreatedAt"`
 	PK        string `json:"-" dynamodbav:"PK"`
-	SK        string `json:"-" dynamodbav:"SK"`
 }
 
 type application struct {
@@ -71,6 +71,13 @@ func (app *application) handle(ctx context.Context, request events.APIGatewayV2H
 			author = claims["username"]
 		}
 		return app.createEntry(ctx, request.Body, isOwner(claims["cognito:groups"]), author)
+	case method == http.MethodPut && strings.HasPrefix(path, "/content/"):
+		claims := request.RequestContext.Authorizer.JWT.Claims
+		author := claims["email"]
+		if author == "" {
+			author = claims["username"]
+		}
+		return app.updateEntry(ctx, request.PathParameters["id"], request.Body, isOwner(claims["cognito:groups"]), author)
 	case method == http.MethodPost && path == "/media/upload-url":
 		if !isOwner(request.RequestContext.Authorizer.JWT.Claims["cognito:groups"]) {
 			return response(http.StatusForbidden, map[string]string{"error": "owner access required"}), nil
@@ -79,6 +86,95 @@ func (app *application) handle(ctx context.Context, request events.APIGatewayV2H
 	default:
 		return response(http.StatusNotFound, map[string]string{"error": "not found"}), nil
 	}
+}
+
+func (app *application) updateEntry(ctx context.Context, id, body string, owner bool, author string) (events.APIGatewayV2HTTPResponse, error) {
+	var update struct {
+		SortKey  string `json:"sortKey"`
+		Title    string `json:"title"`
+		Body     string `json:"body"`
+		Date     string `json:"date"`
+		ImageKey string `json:"imageKey"`
+	}
+	if err := json.Unmarshal([]byte(body), &update); err != nil || len(body) > 12000 || id == "" || update.SortKey == "" {
+		return response(http.StatusBadRequest, map[string]string{"error": "invalid update"}), nil
+	}
+	result, err := app.dynamo.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(app.table),
+		Key: map[string]types.AttributeValue{
+			"PK": &types.AttributeValueMemberS{Value: "CONTENT"},
+			"SK": &types.AttributeValueMemberS{Value: update.SortKey},
+		},
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		log.Printf("load entry for update: %v", err)
+		return response(http.StatusInternalServerError, map[string]string{"error": "could not load page"}), nil
+	}
+	if len(result.Item) == 0 {
+		return response(http.StatusNotFound, map[string]string{"error": "page not found"}), nil
+	}
+	var entry Entry
+	if err := attributevalue.UnmarshalMap(result.Item, &entry); err != nil {
+		return response(http.StatusInternalServerError, map[string]string{"error": "could not decode page"}), nil
+	}
+	if entry.ID != id {
+		return response(http.StatusNotFound, map[string]string{"error": "page not found"}), nil
+	}
+	if !canEditEntry(entry, owner, author) {
+		return response(http.StatusForbidden, map[string]string{"error": "you cannot edit this page"}), nil
+	}
+	if strings.TrimSpace(update.Title) == "" || len(update.Title) > 120 || strings.TrimSpace(update.Body) == "" || len(update.Body) > 5000 || len(update.Date) > 80 {
+		return response(http.StatusBadRequest, map[string]string{"error": "page fields are invalid"}), nil
+	}
+	if entry.Kind == "reply" {
+		update.Date, err = formatReplyDate(update.Date, time.Now())
+		if err != nil {
+			return response(http.StatusBadRequest, map[string]string{"error": "reply date must be a calendar date"}), nil
+		}
+	} else if strings.TrimSpace(update.Date) == "" {
+		return response(http.StatusBadRequest, map[string]string{"error": "page date is required"}), nil
+	}
+	if update.ImageKey != "" && !strings.HasPrefix(update.ImageKey, "uploads/") {
+		return response(http.StatusBadRequest, map[string]string{"error": "invalid image reference"}), nil
+	}
+	updated, err := app.dynamo.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(app.table),
+		Key: map[string]types.AttributeValue{
+			"PK": &types.AttributeValueMemberS{Value: "CONTENT"},
+			"SK": &types.AttributeValueMemberS{Value: update.SortKey},
+		},
+		UpdateExpression:         aws.String("SET #title = :title, #body = :body, #date = :date, ImageKey = :imageKey"),
+		ExpressionAttributeNames: map[string]string{"#title": "Title", "#body": "Body", "#date": "Date"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":title":    &types.AttributeValueMemberS{Value: strings.TrimSpace(update.Title)},
+			":body":     &types.AttributeValueMemberS{Value: strings.TrimSpace(update.Body)},
+			":date":     &types.AttributeValueMemberS{Value: update.Date},
+			":imageKey": &types.AttributeValueMemberS{Value: update.ImageKey},
+		},
+		ReturnValues: types.ReturnValueAllNew,
+	})
+	if err != nil {
+		log.Printf("update entry: %v", err)
+		return response(http.StatusInternalServerError, map[string]string{"error": "could not save page"}), nil
+	}
+	if err := attributevalue.UnmarshalMap(updated.Attributes, &entry); err != nil {
+		return response(http.StatusInternalServerError, map[string]string{"error": "could not decode saved page"}), nil
+	}
+	if entry.ImageKey != "" {
+		image, err := app.presigner.PresignGetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(app.bucket), Key: aws.String(entry.ImageKey)}, func(options *s3.PresignOptions) { options.Expires = 10 * time.Minute })
+		if err == nil {
+			entry.ImageURL = image.URL
+		}
+	}
+	return response(http.StatusOK, entry), nil
+}
+
+func canEditEntry(entry Entry, owner bool, author string) bool {
+	if entry.Kind == "reply" {
+		return owner || (author != "" && entry.Author == author)
+	}
+	return owner && (entry.Kind == "letter" || entry.Kind == "diary" || entry.Kind == "memory")
 }
 
 func (app *application) listEntries(ctx context.Context) (events.APIGatewayV2HTTPResponse, error) {
@@ -141,7 +237,7 @@ func (app *application) createEntry(ctx context.Context, body string, owner bool
 	}
 	entry.ID = id
 	entry.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	entry.PK, entry.SK = "CONTENT", entry.CreatedAt+"#"+entry.ID
+	entry.PK, entry.SortKey = "CONTENT", entry.CreatedAt+"#"+entry.ID
 	item, err := attributevalue.MarshalMap(entry)
 	if err != nil {
 		return events.APIGatewayV2HTTPResponse{}, err

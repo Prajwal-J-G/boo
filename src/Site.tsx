@@ -6,6 +6,7 @@ import './Site.css'
 
 type Entry = {
   id: string
+  sortKey?: string
   kind: 'letter' | 'diary' | 'memory' | 'reply'
   title: string
   body: string
@@ -91,8 +92,9 @@ function Site() {
   const [newPasswordRequired, setNewPasswordRequired] = useState(false)
   const [busy, setBusy] = useState(false)
   const [editorOpen, setEditorOpen] = useState(false)
-  const [composerMode, setComposerMode] = useState<'entry' | 'reply'>('entry')
+  const [composerMode, setComposerMode] = useState<'entry' | 'reply' | 'edit'>('entry')
   const [replyTarget, setReplyTarget] = useState<Entry | null>(null)
+  const [editingEntry, setEditingEntry] = useState<Entry | null>(null)
 
   useEffect(() => {
     if (!authConfigured) return
@@ -114,6 +116,16 @@ function Site() {
   const memories = entries.filter((entry) => entry.kind === 'memory')
   const letters = entries.filter((entry) => entry.kind === 'letter')
   const diary = entries.filter((entry) => entry.kind === 'diary')
+  function pageReplies(page: Entry) {
+    return entries.filter((entry) => entry.kind === 'reply' && entry.replyTo === page.id)
+  }
+
+  function pageActions(page: Entry) {
+    return <div className="saved-page-actions">
+      {(isOwner || (page.kind === 'reply' && page.author === userEmail)) && <button className="page-action" type="button" onClick={() => openEditComposer(page)}>Edit page</button>}
+      {authenticated && page.kind !== 'reply' && <button className="page-action" type="button" onClick={() => openReply(page)}>Write back <ArrowRight size={14} /></button>}
+    </div>
+  }
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -166,7 +178,8 @@ function Site() {
     setBusy(true)
     setAuthError('')
     try {
-      const photo = composerMode === 'entry' ? form.get('photo') : null
+      const canAttachPhoto = composerMode === 'entry' || (composerMode === 'edit' && editingEntry?.kind === 'memory')
+      const photo = canAttachPhoto ? form.get('photo') : null
       let imageKey: string | undefined
       const localPreview = env.DEV && !authConfigured
       if (photo instanceof File && photo.size > 0) {
@@ -180,21 +193,27 @@ function Site() {
         }
       }
       const isReply = composerMode === 'reply'
+      const isEditing = composerMode === 'edit' && editingEntry !== null
       const date = String(form.get('date') || localDateValue())
       const payload = {
-        kind: isReply ? 'reply' as const : String(form.get('kind')) as Entry['kind'],
+        kind: isReply ? 'reply' as const : isEditing ? editingEntry.kind : String(form.get('kind')) as Entry['kind'],
         title: isReply ? `Re: ${replyTarget?.title ?? ''}` : String(form.get('title')),
         body: String(form.get('body')),
         date,
-        replyTo: isReply ? replyTarget?.id : undefined,
-        imageKey,
+        replyTo: isReply ? replyTarget?.id : isEditing ? editingEntry.replyTo : undefined,
+        imageKey: imageKey ?? (isEditing ? editingEntry.imageKey : undefined),
       }
-      const entry: Entry = localPreview
+      const entry: Entry = isEditing && localPreview
+        ? { ...editingEntry, ...payload, id: editingEntry.id, sortKey: editingEntry.sortKey, date: new Date(`${date}T00:00:00`).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }), imageUrl: photo instanceof File && photo.size > 0 ? URL.createObjectURL(await optimizePhoto(photo)) : editingEntry.imageUrl }
+        : isEditing
+          ? await apiRequest<Entry>(`/content/${encodeURIComponent(editingEntry.id)}`, { method: 'PUT', body: JSON.stringify({ ...payload, sortKey: editingEntry.sortKey }) })
+          : localPreview
         ? { ...payload, id: crypto.randomUUID(), date: new Date(`${date}T00:00:00`).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }), author: isReply ? 'A NOTE BACK' : undefined, imageUrl: photo instanceof File && photo.size > 0 ? URL.createObjectURL(await optimizePhoto(photo)) : undefined }
         : await apiRequest<Entry>('/content', { method: 'POST', body: JSON.stringify(payload) })
-      setEntries((current) => [entry, ...current])
+      setEntries((current) => isEditing ? current.map((existing) => existing.id === entry.id ? entry : existing) : [entry, ...current])
       setEditorOpen(false)
       setReplyTarget(null)
+      setEditingEntry(null)
       formElement.reset()
     } catch {
       setAuthError('Could not save this page. Check the photo size and try again.')
@@ -213,6 +232,7 @@ function Site() {
   function openReply(letter: Entry) {
     setComposerMode('reply')
     setReplyTarget(letter)
+    setEditingEntry(null)
     setAuthError('')
     setEditorOpen(true)
   }
@@ -220,6 +240,15 @@ function Site() {
   function openEntryComposer() {
     setComposerMode('entry')
     setReplyTarget(null)
+    setEditingEntry(null)
+    setAuthError('')
+    setEditorOpen(true)
+  }
+
+  function openEditComposer(entry: Entry) {
+    setComposerMode('edit')
+    setEditingEntry(entry)
+    setReplyTarget(entry.kind === 'reply' ? entries.find((candidate) => candidate.id === entry.replyTo) ?? null : null)
     setAuthError('')
     setEditorOpen(true)
   }
@@ -227,6 +256,7 @@ function Site() {
   function closeComposer() {
     setEditorOpen(false)
     setReplyTarget(null)
+    setEditingEntry(null)
   }
 
   if (!authChecked) return <main className="gate-loading"><Heart size={20} /> Opening your little world...</main>
@@ -278,28 +308,23 @@ function Site() {
 
       <section className="letter-band section-wrap" id="letters">
         <div className="section-heading"><div><p className="eyebrow">01 — WORDS I KEEP MEANING</p><h2>Letters to <em>you</em></h2></div><span className="heading-aside">Written slowly. Meant forever.</span></div>
-        <div className="letter-grid">{letters.map((entry, index) => <motion.article className="letter-card" key={entry.id} initial={{ opacity: 0, y: 22 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true, amount: .2 }} transition={{ duration: .65, delay: index * .12 }}><span className="letter-number">A LETTER {String(index + 1).padStart(2, '0')}</span><h3>{entry.title}</h3><p>{entry.body}</p><span className="letter-date">{entry.date}</span></motion.article>)}{!letters.length && <p className="empty-note">The next letter is waiting to be written.</p>}</div>
-      </section>
-
-      <section className="correspondence section-wrap">
-        <div className="section-heading"><div><p className="eyebrow">A PAGE LEFT OPEN</p><h2>Write <em>back</em></h2></div><span className="heading-aside">The sweetest conversations are the ones we keep.</span></div>
-        <div className="correspondence-grid">{letters.map((letter) => <article className="correspondence-card" key={`thread-${letter.id}`}>
-          <div className="correspondence-original"><span className="letter-number">IN REPLY TO</span><h3>{letter.title}</h3></div>
-          {entries.filter((entry) => entry.kind === 'reply' && entry.replyTo === letter.id).map((reply) => <div className="reply-slip" key={reply.id}><span className="reply-byline">{reply.author || 'A note from us'} · {reply.date}</span><p>{reply.body}</p></div>)}
-          <button className="reply-button" type="button" onClick={() => openReply(letter)}>Write a little reply <ArrowRight size={15} /></button>
-        </article>)}</div>
-        {!letters.length && <p className="empty-note">A letter will find its way here when one is written.</p>}
+        <div className="letter-grid">{letters.map((entry, index) => <motion.article className="letter-card" key={entry.id} initial={{ opacity: 0, y: 22 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true, amount: .2 }} transition={{ duration: .65, delay: index * .12 }}><span className="letter-number">A LETTER {String(index + 1).padStart(2, '0')}</span><h3>{entry.title}</h3><p>{entry.body}</p><span className="letter-date">{entry.date}</span>{pageReplies(entry).map((reply) => <div className="reply-slip" key={reply.id}><span className="reply-byline">{reply.author || 'A note from us'} · {reply.date}</span><p>{reply.body}</p>{pageActions(reply)}</div>)}{pageActions(entry)}</motion.article>)}{!letters.length && <p className="empty-note">The next letter is waiting to be written.</p>}</div>
       </section>
 
       <section className="diary-band" id="diary">
         <div className="diary-inner section-wrap"><div className="diary-heading"><p className="eyebrow">02 — THE THINGS I ALMOST DIDN'T SAY</p><h2>Diary <em>confessions</em></h2><p className="diary-intro">Little truths from the margins of our days.</p></div>
-          <div className="diary-list">{diary.map((entry, index) => <motion.article className="diary-entry" key={entry.id} initial={{ opacity: 0, y: 22 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true, amount: .25 }} transition={{ duration: .6, delay: index * .12 }}><span className="diary-date">{entry.date}</span><div><h3>{entry.title}</h3><p>{entry.body}</p></div><span className="diary-heart"><Heart size={18} /></span></motion.article>)}{!diary.length && <p className="empty-note">A quiet page, for now.</p>}</div>
+          <div className="diary-list">{diary.map((entry, index) => <motion.article className="diary-entry" key={entry.id} initial={{ opacity: 0, y: 22 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true, amount: .25 }} transition={{ duration: .6, delay: index * .12 }}><span className="diary-date">{entry.date}</span><div><h3>{entry.title}</h3><p>{entry.body}</p>{pageReplies(entry).map((reply) => <div className="reply-slip" key={reply.id}><span className="reply-byline">{reply.author || 'A note from us'} · {reply.date}</span><p>{reply.body}</p>{pageActions(reply)}</div>)}{pageActions(entry)}</div><span className="diary-heart"><Heart size={18} /></span></motion.article>)}{!diary.length && <p className="empty-note">A quiet page, for now.</p>}</div>
         </div><span className="diary-doodle" aria-hidden="true">♡</span>
       </section>
 
       <section className="moments-section section-wrap" id="moments">
         <div className="section-heading moments-heading"><div><p className="eyebrow">03 — PROOF OF ALL THIS JOY</p><h2>Our little <em>moments</em></h2></div><p className="heading-aside">A thousand small reasons<br />to choose you, every day.</p></div>
-        <div className="gallery-grid">{memories.map((entry, index) => <motion.button type="button" className={`gallery-item gallery-item-${index % 3}`} key={entry.id} onClick={() => setActivePhoto(entry)} initial={{ opacity: 0, y: 28 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true, amount: .15 }} transition={{ duration: .7, delay: (index % 3) * .1 }}><span className="gallery-image"><img src={entry.imageUrl} alt={entry.imageAlt ?? entry.title} loading="lazy" /><span className="gallery-open"><ArrowUpRight size={18} /></span></span><span className="gallery-meta"><span><span className="gallery-date">{entry.date}</span><span className="gallery-title">{entry.title}</span></span><ArrowUpRight size={16} /></span></motion.button>)}{!memories.length && <p className="empty-note">Our first photo belongs here.</p>}</div>
+        <div className="gallery-window"><div className="gallery-track">{[false, true].map((duplicate) => <div className="gallery-run" key={String(duplicate)} aria-hidden={duplicate || undefined} inert={duplicate}>{memories.map((entry, index) => <article className="gallery-card" key={`${duplicate ? 'copy-' : ''}${entry.id}`}>
+          <button type="button" className="gallery-photo-button" aria-label={`Open ${entry.title}`} tabIndex={duplicate ? -1 : undefined} onClick={() => setActivePhoto(entry)}><span className="gallery-image"><img src={entry.imageUrl} alt={duplicate ? '' : entry.imageAlt ?? entry.title} loading="lazy" /><span className="gallery-open"><ArrowUpRight size={18} /></span></span></button>
+          <div className="gallery-meta"><span><span className="gallery-date">{entry.date}</span><span className="gallery-title">{entry.title}</span></span><span className="gallery-card-count">{String(index + 1).padStart(2, '0')}</span></div>
+          {pageReplies(entry).map((reply) => <div className="reply-slip gallery-reply" key={reply.id}><span className="reply-byline">{reply.author || 'A note from us'} · {reply.date}</span><p>{reply.body}</p>{pageActions(reply)}</div>)}
+          {pageActions(entry)}
+        </article>)}</div>)}</div></div>{!memories.length && <p className="empty-note">Our first photo belongs here.</p>}
         <div className="gallery-endnote"><span>AND THIS IS ONLY THE BEGINNING</span><Heart size={15} fill="currentColor" /><span>MORE MEMORIES TO COME</span></div>
       </section>
       <section className="closing-note"><span className="closing-star">✳</span><p>In every version of the story,<br /><em>I’d still find my way to you.</em></p><span className="closing-sign">Yours, in all the little ways</span></section>

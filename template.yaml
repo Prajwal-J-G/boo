@@ -7,6 +7,14 @@ Parameters:
     Type: String
     Default: http://localhost:5173
     Description: Exact frontend origin, without a trailing slash.
+  EnableCloudFront:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Create the AWS CloudFront frontend when not hosting the shell elsewhere.
+
+Conditions:
+  CreateCloudFront: !Equals [!Ref EnableCloudFront, 'true']
 
 Globals:
   Function:
@@ -124,6 +132,7 @@ Resources:
 
   WebBucket:
     Type: AWS::S3::Bucket
+    Condition: CreateCloudFront
     Properties:
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
@@ -137,6 +146,7 @@ Resources:
 
   WebOriginAccessControl:
     Type: AWS::CloudFront::OriginAccessControl
+    Condition: CreateCloudFront
     Properties:
       OriginAccessControlConfig:
         Name: our-always-web-oac
@@ -147,6 +157,7 @@ Resources:
 
   WebDistribution:
     Type: AWS::CloudFront::Distribution
+    Condition: CreateCloudFront
     Properties:
       DistributionConfig:
         Enabled: true
@@ -178,6 +189,7 @@ Resources:
 
   WebBucketPolicy:
     Type: AWS::S3::BucketPolicy
+    Condition: CreateCloudFront
     Properties:
       Bucket: !Ref WebBucket
       PolicyDocument:
@@ -230,6 +242,14 @@ Resources:
             Method: POST
             Auth:
               Authorizer: PrivateAuth
+        UpdateContent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PrivateSiteApi
+            Path: /content/{id}
+            Method: PUT
+            Auth:
+              Authorizer: PrivateAuth
         CreateUploadUrl:
           Type: HttpApi
           Properties:
@@ -248,11 +268,14 @@ Outputs:
   UserPoolClientId:
     Value: !Ref PrivateUserPoolClient
   WebBucketName:
+    Condition: CreateCloudFront
     Value: !Ref WebBucket
   WebsiteUrl:
+    Condition: CreateCloudFront
     Description: CloudFront site URL.
     Value: !Sub https://${WebDistribution.DomainName}
   WebDistributionId:
+    Condition: CreateCloudFront
     Value: !Ref WebDistribution
   OwnersGroupName:
     Value: !Ref OwnersGroup

@@ -75,3 +75,26 @@ func TestValidEntryPermissions(t *testing.T) {
 		})
 	}
 }
+
+func TestCanEditEntry(t *testing.T) {
+	tests := []struct {
+		name   string
+		entry  Entry
+		owner  bool
+		author string
+		want   bool
+	}{
+		{name: "owner edits letter", entry: Entry{Kind: "letter"}, owner: true, want: true},
+		{name: "partner cannot edit letter", entry: Entry{Kind: "letter"}, author: "partner@example.com", want: false},
+		{name: "owner edits any reply", entry: Entry{Kind: "reply", Author: "partner@example.com"}, owner: true, want: true},
+		{name: "reply author edits own reply", entry: Entry{Kind: "reply", Author: "partner@example.com"}, author: "partner@example.com", want: true},
+		{name: "other partner cannot edit reply", entry: Entry{Kind: "reply", Author: "partner@example.com"}, author: "owner@example.com", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := canEditEntry(test.entry, test.owner, test.author); got != test.want {
+				t.Errorf("canEditEntry(%+v, %t, %q) = %t, want %t", test.entry, test.owner, test.author, got, test.want)
+			}
+		})
+	}
+}

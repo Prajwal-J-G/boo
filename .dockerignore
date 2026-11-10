@@ -7,4 +7,11 @@ node_modules
 dist
 dist-ssr
 backend
+.aws-sam
+terraform/**/.terraform
+terraform/**/*.tfstate
+terraform/**/*.tfstate.*
+terraform/**/*.tfplan
+test-results
+playwright-report
 *.log
